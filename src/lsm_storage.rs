@@ -132,6 +132,192 @@ pub(crate) struct LsmStorageInner {
     pub(crate) compaction_filters: Arc<Mutex<Vec<CompactionFilter>>>,
 }
 
+impl LsmStorageInner {
+    pub(crate) fn next_sst_id(&self) -> usize {
+        self.next_sst_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
+    /// not exist.
+    pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
+        let path = path.as_ref();
+        let state = LsmStorageState::create(&options);
+
+        let compaction_controller = match &options.compaction_options {
+            CompactionOptions::Leveled(options) => {
+                CompactionController::Leveled(LeveledCompactionController::new(options.clone()))
+            }
+            CompactionOptions::Tiered(options) => {
+                CompactionController::Tiered(TieredCompactionController::new(options.clone()))
+            }
+            CompactionOptions::Simple(options) => CompactionController::Simple(
+                SimpleLeveledCompactionController::new(options.clone()),
+            ),
+            CompactionOptions::NoCompaction => CompactionController::NoCompaction,
+        };
+
+        let storage = Self {
+            state: Arc::new(RwLock::new(Arc::new(state))),
+            state_lock: Mutex::new(()),
+            path: path.to_path_buf(),
+            block_cache: Arc::new(BlockCache::new(1024)),
+            next_sst_id: AtomicUsize::new(1),
+            compaction_controller,
+            manifest: None,
+            options: options.into(),
+            mvcc: None,
+            compaction_filters: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        Ok(storage)
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        unimplemented!()
+    }
+
+    pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
+        let mut compaction_filters = self.compaction_filters.lock();
+        compaction_filters.push(compaction_filter);
+    }
+
+    /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let guard = self.state.read();
+        let snapshot = &guard;
+
+        // Search on current memtable
+        if let Some(value) = snapshot.memtable.get(key) {
+            if value.is_empty() {
+                // found tombstone
+                return Ok(None);
+            }
+            return Ok(Some(value));
+        }
+
+        // Search on immutable memtables
+        for memtable in snapshot.imm_memtables.iter() {
+            if let Some(value) = memtable.get(key) {
+                if value.is_empty() {
+                    // found tombstone
+                    return Ok(None);
+                }
+                return Ok(Some(value));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Write a batch of data into the storage. Implement in week 2 day 7.
+    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        unimplemented!()
+    }
+
+    /// Put a key-value pair into the storage by writing into the current memtable.
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        assert!(!key.is_empty(), "key cannot be empty");
+        assert!(!value.is_empty(), "value cannot be empty");
+
+        let size;
+        {
+            let guard = self.state.read();
+            guard.memtable.put(key, value)?;
+            size = guard.memtable.approximate_size();
+        }
+
+        self.try_freeze(size)?;
+
+        Ok(())
+    }
+
+    /// Remove a key from the storage by writing an empty value.
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        assert!(!key.is_empty(), "key cannot be empty");
+
+        let size;
+        {
+            let guard = self.state.read();
+            guard.memtable.put(key, b"")?;
+            size = guard.memtable.approximate_size();
+        }
+
+        self.try_freeze(size)?;
+
+        Ok(())
+    }
+
+    fn try_freeze(&self, estimated_size: usize) -> Result<()> {
+        if estimated_size >= self.options.target_sst_size {
+            let state_lock = self.state_lock.lock();
+            let guard = self.state.read();
+            // the memtable could have already been frozen, check again to ensure we really need to freeze it
+            if guard.memtable.approximate_size() >= self.options.target_sst_size {
+                drop(guard);
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
+        path.as_ref().join(format!("{:05}.sst", id))
+    }
+
+    pub(crate) fn path_of_sst(&self, id: usize) -> PathBuf {
+        Self::path_of_sst_static(&self.path, id)
+    }
+
+    pub(crate) fn path_of_wal_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
+        path.as_ref().join(format!("{:05}.wal", id))
+    }
+
+    pub(crate) fn path_of_wal(&self, id: usize) -> PathBuf {
+        Self::path_of_wal_static(&self.path, id)
+    }
+
+    pub(super) fn sync_dir(&self) -> Result<()> {
+        unimplemented!()
+    }
+
+    pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+        let memtable_id = self.next_sst_id();
+        let memtable = Arc::new(MemTable::create(memtable_id));
+
+        let old_memtable;
+        {
+            let mut guard = self.state.write();
+            // Swap the current memtable with the new one
+            let mut snapshot = guard.as_ref().clone();
+            old_memtable = std::mem::replace(&mut snapshot.memtable, memtable);
+            snapshot.imm_memtables.insert(0, old_memtable);
+            *guard = Arc::new(snapshot);
+        }
+
+        Ok(())
+    }
+
+    /// Force flush the earliest-created immutable memtable to disk
+    pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
+        unimplemented!()
+    }
+
+    pub fn new_txn(&self) -> Result<()> {
+        // no-op
+        Ok(())
+    }
+
+    /// Create an iterator over a range of keys.
+    pub fn scan(
+        &self,
+        _lower: Bound<&[u8]>,
+        _upper: Bound<&[u8]>,
+    ) -> Result<FusedIterator<LsmIterator>> {
+        unimplemented!()
+    }
+}
+
 /// A thin wrapper for `LsmStorageInner` and the user interface for LSM.
 pub struct Lsm {
     pub(crate) inner: Arc<LsmStorageInner>,
@@ -224,120 +410,5 @@ impl Lsm {
 
     pub fn force_full_compaction(&self) -> Result<()> {
         self.inner.force_full_compaction()
-    }
-}
-
-impl LsmStorageInner {
-    pub(crate) fn next_sst_id(&self) -> usize {
-        self.next_sst_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
-    /// not exist.
-    pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
-        let path = path.as_ref();
-        let state = LsmStorageState::create(&options);
-
-        let compaction_controller = match &options.compaction_options {
-            CompactionOptions::Leveled(options) => {
-                CompactionController::Leveled(LeveledCompactionController::new(options.clone()))
-            }
-            CompactionOptions::Tiered(options) => {
-                CompactionController::Tiered(TieredCompactionController::new(options.clone()))
-            }
-            CompactionOptions::Simple(options) => CompactionController::Simple(
-                SimpleLeveledCompactionController::new(options.clone()),
-            ),
-            CompactionOptions::NoCompaction => CompactionController::NoCompaction,
-        };
-
-        let storage = Self {
-            state: Arc::new(RwLock::new(Arc::new(state))),
-            state_lock: Mutex::new(()),
-            path: path.to_path_buf(),
-            block_cache: Arc::new(BlockCache::new(1024)),
-            next_sst_id: AtomicUsize::new(1),
-            compaction_controller,
-            manifest: None,
-            options: options.into(),
-            mvcc: None,
-            compaction_filters: Arc::new(Mutex::new(Vec::new())),
-        };
-
-        Ok(storage)
-    }
-
-    pub fn sync(&self) -> Result<()> {
-        unimplemented!()
-    }
-
-    pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
-        let mut compaction_filters = self.compaction_filters.lock();
-        compaction_filters.push(compaction_filter);
-    }
-
-    /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
-    }
-
-    /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
-    }
-
-    /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
-    }
-
-    /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
-    }
-
-    pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
-        path.as_ref().join(format!("{:05}.sst", id))
-    }
-
-    pub(crate) fn path_of_sst(&self, id: usize) -> PathBuf {
-        Self::path_of_sst_static(&self.path, id)
-    }
-
-    pub(crate) fn path_of_wal_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
-        path.as_ref().join(format!("{:05}.wal", id))
-    }
-
-    pub(crate) fn path_of_wal(&self, id: usize) -> PathBuf {
-        Self::path_of_wal_static(&self.path, id)
-    }
-
-    pub(super) fn sync_dir(&self) -> Result<()> {
-        unimplemented!()
-    }
-
-    /// Force freeze the current memtable to an immutable memtable
-    pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
-    }
-
-    /// Force flush the earliest-created immutable memtable to disk
-    pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
-    }
-
-    pub fn new_txn(&self) -> Result<()> {
-        // no-op
-        Ok(())
-    }
-
-    /// Create an iterator over a range of keys.
-    pub fn scan(
-        &self,
-        _lower: Bound<&[u8]>,
-        _upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
     }
 }
